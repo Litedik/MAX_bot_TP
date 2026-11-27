@@ -2,6 +2,7 @@
 
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from database import (
     get_all_linked_users, get_notification_settings,
     is_notification_sent, mark_notification_sent, cleanup_old_history
@@ -10,6 +11,35 @@ from site_api import get_forecasts, get_chat_messages, get_fantasy_teams
 from max_api import send_message, rate_limit_pause
 from config import CHAT_INTERVAL, FORECAST_INTERVAL, FANTASY_INTERVAL
 from logger import logger
+
+# Часовой пояс сайта (Москва, UTC+3) — время матчей приходит в нём
+SITE_TZ = timezone(timedelta(hours=3))
+
+
+def format_match_time(match):
+    """
+    ⭐ Время матча вместо значка 🆚.
+    Сегодняшний матч -> "21:30", матч в другой день -> "28.11 19:00".
+    Источник: match_datetime (МСК), запасной вариант — match_timestamp.
+    """
+    dt = None
+    raw = match.get('match_datetime')
+    if raw:
+        try:
+            dt = datetime.strptime(raw, '%Y-%m-%d %H:%M:%S')
+        except (ValueError, TypeError):
+            dt = None
+    if dt is None and match.get('match_timestamp'):
+        try:
+            dt = datetime.fromtimestamp(float(match['match_timestamp']), SITE_TZ).replace(tzinfo=None)
+        except (ValueError, TypeError, OSError):
+            dt = None
+    if dt is None:
+        return ''
+    today = datetime.now(SITE_TZ).date()
+    if dt.date() == today:
+        return dt.strftime('%H:%M')
+    return dt.strftime('%d.%m %H:%M')
 
 
 def check_forecasts(users, forecast_data):
@@ -28,11 +58,15 @@ def check_forecasts(users, forecast_data):
             not_forecasted = match.get('not_forecasted', [])
             if seconds_until > 0 and not_forecasted:
                 is_urgent = seconds_until < 3600
+                # ⭐ Строка матча: ВРЕМЯ + название (вместо 🆚)
+                match_name = match.get('match_name', 'Матч')
+                time_str = format_match_time(match)
+                match_line = f"{time_str} {match_name}" if time_str else match_name
                 for site_user_id in not_forecasted:
                     site_user_id = int(site_user_id)
                     if site_user_id not in users_missing:
                         users_missing[site_user_id] = {'matches': [], 'match_ids': [], 'is_urgent': False}
-                    users_missing[site_user_id]['matches'].append(match.get('match_name', 'Матч'))
+                    users_missing[site_user_id]['matches'].append(match_line)
                     users_missing[site_user_id]['match_ids'].append(int(match.get('match_id', 0)))
                     if is_urgent:
                         users_missing[site_user_id]['is_urgent'] = True
@@ -48,9 +82,10 @@ def check_forecasts(users, forecast_data):
             if is_notification_sent(user_id, 'forecast_reminder', event_id):
                 continue
             urgency = "🔥 **СРОЧНО:** " if data['is_urgent'] else ""
-            matches_list = "\n".join([f"🆚 {m}" for m in data['matches']])
+            # ⭐ Просто список строк "время + матч", без 🆚
+            matches_list = "\n".join(data['matches'])
             msg = (f"{urgency}📊 **Вы не проставили прогнозы!**\n\n🏆 {tournament_name}\n\n"
-                   f"Матчи без прогноза:\n{matches_list}\n\n🔗 Страница тура: {tournament_link}\n\n"
+                   f"Матчи без прогноза (время — МСК):\n{matches_list}\n\n🔗 Страница тура: {tournament_link}\n\n"
                    f"Пожалуйста, сделайте свой выбор до начала игр.")
             keyboard = [
                 [{'type': 'link', 'text': '🔗 Перейти к прогнозам', 'url': tournament_link}],
